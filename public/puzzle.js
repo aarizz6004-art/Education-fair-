@@ -18,8 +18,13 @@ const PuzzleEngine = (function () {
   let animFrame = null;
   let snapSound = null;
   let isRunning = false;
-  let externalPieceColors = {}; // pieceId -> playerColor (multiplayer)
-  let lockedPieces = new Set(); // pieces grabbed by others
+  let isPaused = false;
+  let waveEnabled = true;
+  let waveTime = 0;
+  let lastLoopTs = 0;
+  let eventsBound = false;
+  let lastWaveOffset = new Map();
+  let snapRipples = [];
 
   // ─── Jigsaw tab geometry ────────────────────
   const TAB_SIZE = 0.25;  // fraction of piece size
@@ -123,12 +128,32 @@ const PuzzleEngine = (function () {
     snappedCount = 0;
     score = 0;
     pieces = [];
-    externalPieceColors = {};
-    lockedPieces = new Set();
+    isPaused = false;
+    waveEnabled = cfg.wave !== false;
+    waveTime = 0;
+    lastLoopTs = 0;
+    lastWaveOffset.clear();
+    snapRipples = [];
 
     resize();
-    window.addEventListener('resize', resize);
-    bindEvents();
+    if (!eventsBound) {
+      window.addEventListener('resize', resize);
+      bindEvents();
+      eventsBound = true;
+    }
+  }
+
+  function getPlayBounds() {
+    return {
+      minX: 10,
+      maxX: Math.max(10, canvas.width - PIECE_W - 10),
+      minY: 66,
+      maxY: Math.max(66, canvas.height - PIECE_H - 10)
+    };
+  }
+
+  function clamp(v, min, max) {
+    return Math.min(Math.max(v, min), max);
   }
 
   function resize() {
@@ -138,10 +163,9 @@ const PuzzleEngine = (function () {
     ghostCanvas.width = canvas.width;
     ghostCanvas.height = canvas.height;
 
-    // Board occupies center area (leave room for HUD and scoreboard)
-    const mp = Network.isConnected() ? 220 : 0;
-    const marginTop = 60, marginBottom = 20, marginSide = 20;
-    boardW = canvas.width - marginSide * 2 - mp;
+    // Board occupies center area (leave room for HUD)
+    const marginTop = 64, marginBottom = 24, marginSide = 24;
+    boardW = canvas.width - marginSide * 2;
     boardH = canvas.height - marginTop - marginBottom;
     boardX = marginSide;
     boardY = marginTop;
@@ -150,12 +174,18 @@ const PuzzleEngine = (function () {
     PIECE_W = Math.floor(boardW / cols);
     PIECE_H = Math.floor(boardH / rows);
 
-    // Snap positions for all pieces
+    // Update snap and scatter bounds for all pieces
     if (pieces.length > 0) {
+      const bounds = getPlayBounds();
       pieces.forEach(p => {
+        p.snapX = boardX + p.col * PIECE_W;
+        p.snapY = boardY + p.row * PIECE_H;
         if (p.snapped) {
-          p.x = boardX + p.col * PIECE_W;
-          p.y = boardY + p.row * PIECE_H;
+          p.x = p.snapX;
+          p.y = p.snapY;
+        } else {
+          p.baseX = clamp(p.baseX ?? p.x, bounds.minX, bounds.maxX);
+          p.baseY = clamp(p.baseY ?? p.y, bounds.minY, bounds.maxY);
         }
       });
     }
@@ -188,8 +218,16 @@ const PuzzleEngine = (function () {
   function drawGhost() {
     if (!sourceImage || !ghostCtx) return;
     ghostCtx.clearRect(0, 0, ghostCanvas.width, ghostCanvas.height);
-    // Draw image scaled to board area
-    ghostCtx.drawImage(sourceImage, boardX, boardY, boardW, boardH);
+    // Draw image scaled to exact snapped board grid
+    ghostCtx.drawImage(sourceImage, boardX, boardY, cols * PIECE_W, rows * PIECE_H);
+  }
+
+  function randomScatterPos() {
+    const { minX, maxX, minY, maxY } = getPlayBounds();
+    return {
+      x: minX + Math.random() * (maxX - minX),
+      y: minY + Math.random() * (maxY - minY)
+    };
   }
 
   function buildPieces() {
@@ -222,25 +260,18 @@ const PuzzleEngine = (function () {
 
         const snapX = boardX + c * PIECE_W;
         const snapY = boardY + r * PIECE_H;
-
-        // Random scatter position (outside the board area, in the margins)
-        let sx, sy;
-        if (Math.random() < 0.5) {
-          sx = Math.random() * (canvas.width - PIECE_W);
-          sy = Math.random() < 0.5 ? Math.random() * 50 : canvas.height - PIECE_H - Math.random() * 50;
-        } else {
-          sy = Math.random() * (canvas.height - PIECE_H);
-          sx = Math.random() < 0.5 ? Math.random() * 50 : canvas.width - PIECE_W - 50 - (Network.isConnected() ? 220 : 0);
-        }
+        const pos = randomScatterPos();
 
         pieces.push({
           id: `${r}-${c}`,
           col: c, row: r,
-          x: sx, y: sy,
+          x: pos.x, y: pos.y,
+          baseX: pos.x, baseY: pos.y,
           snapX, snapY,
           tabs,
           snapped: false,
           rotation: settings.rotation ? (Math.floor(Math.random() * 4) * 90) : 0,
+          wavePhase: c * 0.7 + r * 0.45,
           zIndex: r * cols + c,
           highlightAlpha: 0, // for snap flash
         });
@@ -252,27 +283,32 @@ const PuzzleEngine = (function () {
   async function scrambleAnimation() {
     return new Promise(resolve => {
       let t = 0;
-      const dur = 60;
+      const dur = 65;
       function animStep() {
         t++;
-        pieces.forEach((p, i) => {
-          const phase = (t / dur) + (i / pieces.length) * 0.5;
-          p.x = boardX + p.col * PIECE_W + Math.sin(phase * 5) * 30 * (1 - t / dur);
-          p.y = boardY + p.row * PIECE_H + Math.cos(phase * 5) * 30 * (1 - t / dur);
+        const raw = Math.min(1, t / dur);
+        // Smooth ease-in-out
+        const ease = raw < 0.5 ? 2 * raw * raw : 1 - Math.pow(-2 * raw + 2, 2) / 2;
+        const waveEnvelope = Math.sin(raw * Math.PI);
+
+        pieces.forEach((p) => {
+          const waveArcX = Math.sin(p.wavePhase + raw * 6) * 26 * waveEnvelope;
+          const waveArcY = Math.cos(p.wavePhase * 1.2 + raw * 6) * 22 * waveEnvelope;
+          p.x = p.snapX + (p.baseX - p.snapX) * ease + waveArcX;
+          p.y = p.snapY + (p.baseY - p.snapY) * ease + waveArcY;
         });
         render();
         if (t < dur) requestAnimationFrame(animStep);
         else {
-          // scatter after
-          buildPieces();
+          pieces.forEach(p => { p.x = p.baseX; p.y = p.baseY; });
           render();
           resolve();
         }
       }
-      // First show assembled
-      pieces.forEach(p => { p.x = boardX + p.col * PIECE_W; p.y = boardY + p.row * PIECE_H; });
+      // First show the newly clicked photo assembled on the board
+      pieces.forEach(p => { p.x = p.snapX; p.y = p.snapY; });
       render();
-      setTimeout(() => requestAnimationFrame(animStep), 500);
+      setTimeout(() => requestAnimationFrame(animStep), 450);
     });
   }
 
@@ -311,16 +347,32 @@ const PuzzleEngine = (function () {
     ctx.save();
     ctx.clip(path);
 
-    // Draw image slice
+    // Draw image slice scaled properly from sourceImage dimensions
+    const imgW = sourceImage.naturalWidth || sourceImage.width;
+    const imgH = sourceImage.naturalHeight || sourceImage.height;
+    const srcPieceW = imgW / cols;
+    const srcPieceH = imgH / rows;
+    const srcExtX = srcPieceW * TAB_SIZE;
+    const srcExtY = srcPieceH * TAB_SIZE;
+    const rawSx = col * srcPieceW - srcExtX;
+    const rawSy = row * srcPieceH - srcExtY;
+    const rawSw = srcPieceW + srcExtX * 2;
+    const rawSh = srcPieceH + srcExtY * 2;
+    const csx = Math.max(0, rawSx);
+    const csy = Math.max(0, rawSy);
+    const csw = Math.min(imgW, rawSx + rawSw) - csx;
+    const csh = Math.min(imgH, rawSy + rawSh) - csy;
+    const extY = ph * TAB_SIZE;
+    const scaleX = pw / srcPieceW;
+    const scaleY = ph / srcPieceH;
+
     ctx.drawImage(
       sourceImage,
-      col * (sourceImage.naturalWidth || sourceImage.width) / cols - ext,
-      row * (sourceImage.naturalHeight || sourceImage.height) / rows - ext,
-      pw + ext * 2,
-      ph + ext * 2,
-      -ext, -ext,
-      pw + ext * 2,
-      ph + ext * 2
+      csx, csy, csw, csh,
+      -ext + (csx - rawSx) * scaleX,
+      -extY + (csy - rawSy) * scaleY,
+      csw * scaleX,
+      csh * scaleY
     );
 
     // Snap highlight flash
@@ -329,19 +381,12 @@ const PuzzleEngine = (function () {
       ctx.fillRect(-ext, -ext, pw + ext * 2, ph + ext * 2);
     }
 
-    // Multiplayer: tint if grabbed by another player
-    if (lockedPieces.has(piece.id)) {
-      const col = externalPieceColors[piece.id] || '#ff6b9d';
-      ctx.fillStyle = hexToRgba(col, 0.3);
-      ctx.fillRect(-ext, -ext, pw + ext * 2, ph + ext * 2);
-    }
-
     ctx.restore();
 
     // Stroke
     ctx.strokeStyle = snapped
       ? 'rgba(255,217,61,0.5)'
-      : (externalPieceColors[piece.id] || 'rgba(255,60,110,0.4)');
+      : 'rgba(255,60,110,0.4)';
     ctx.lineWidth = snapped ? 1 : 1.5;
     ctx.stroke(path);
 
@@ -376,7 +421,7 @@ const PuzzleEngine = (function () {
     if (!isRunning) return;
     const pos = getPos(e);
     const piece = getPieceAt(pos.x, pos.y);
-    if (!piece || piece.snapped || lockedPieces.has(piece.id)) return;
+    if (!piece || piece.snapped) return;
     dragPiece = piece;
     dragOffX = pos.x - piece.x;
     dragOffY = pos.y - piece.y;
@@ -384,7 +429,6 @@ const PuzzleEngine = (function () {
     const maxZ = Math.max(...pieces.map(p => p.zIndex));
     piece.zIndex = maxZ + 1;
     canvas.classList.add('grabbing');
-    Network.emit('piece_grabbed', { pieceId: piece.id });
   }
 
   function onMove(e) {
@@ -392,13 +436,15 @@ const PuzzleEngine = (function () {
     const pos = getPos(e);
     dragPiece.x = pos.x - dragOffX;
     dragPiece.y = pos.y - dragOffY;
-    Network.emit('piece_moved', { pieceId: dragPiece.id, x: dragPiece.x, y: dragPiece.y, snapped: false });
   }
 
   function onUp() {
     if (!dragPiece) return;
+    const off = lastWaveOffset.get(dragPiece.id) || { dx: 0, dy: 0 };
+    const bounds = getPlayBounds();
+    dragPiece.baseX = clamp(dragPiece.x - off.dx, bounds.minX, bounds.maxX);
+    dragPiece.baseY = clamp(dragPiece.y - off.dy, bounds.minY, bounds.maxY);
     trySnap(dragPiece);
-    Network.emit('piece_released', { pieceId: dragPiece.id });
     dragPiece = null;
     canvas.classList.remove('grabbing');
   }
@@ -422,9 +468,8 @@ const PuzzleEngine = (function () {
       snappedCount++;
       score += Math.max(10, Math.floor(100 - dist));
       flashPiece(piece);
+      snapRipples.push({ col: piece.col, row: piece.row, startTime: performance.now() });
       if (onSnapCb) onSnapCb(piece, snappedCount, score);
-      Network.emit('piece_moved', { pieceId: piece.id, x: piece.x, y: piece.y, snapped: true });
-      Network.emit('score_update', { score });
       if (snappedCount === totalPieces) {
         setTimeout(() => { if (onCompleteCb) onCompleteCb(score); }, 300);
       }
@@ -432,9 +477,10 @@ const PuzzleEngine = (function () {
   }
 
   function getPieceAt(x, y) {
+    const pad = 6;
     const sorted = [...pieces].sort((a, b) => b.zIndex - a.zIndex);
     for (const p of sorted) {
-      if (x >= p.x && x <= p.x + PIECE_W && y >= p.y && y <= p.y + PIECE_H) return p;
+      if (x >= p.x - pad && x <= p.x + PIECE_W + pad && y >= p.y - pad && y <= p.y + PIECE_H + pad) return p;
     }
     return null;
   }
@@ -449,14 +495,65 @@ const PuzzleEngine = (function () {
     requestAnimationFrame(fade);
   }
 
-  // ─── Game Loop ────────────────────────────────
+  // ─── Wave Motion & Game Loop ──────────────────
+  function updateWave(now) {
+    if (!lastLoopTs) lastLoopTs = now;
+    const dt = Math.min(0.05, (now - lastLoopTs) / 1000);
+    lastLoopTs = now;
+
+    if (!isPaused && waveEnabled) {
+      waveTime += dt;
+    }
+
+    const bounds = getPlayBounds();
+    const ampX = Math.min(24, Math.max(10, PIECE_W * 0.22));
+    const ampY = Math.min(20, Math.max(8, PIECE_H * 0.18));
+
+    // Expire old snap ripples
+    snapRipples = snapRipples.filter(r => now - r.startTime < 550);
+
+    pieces.forEach(p => {
+      if (p === dragPiece) return;
+
+      if (p.snapped) {
+        let rx = 0, ry = 0;
+        if (waveEnabled && snapRipples.length > 0) {
+          snapRipples.forEach(r => {
+            const age = (now - r.startTime) / 550;
+            const d = Math.hypot(p.col - r.col, p.row - r.row);
+            const ring = Math.sin(d * 1.8 - age * 14) * (1 - age) * 4;
+            rx += ring * 0.5;
+            ry += ring;
+          });
+        }
+        p.x = p.snapX + rx;
+        p.y = p.snapY + ry;
+        return;
+      }
+
+      if (waveEnabled) {
+        const dx = Math.sin(waveTime * 2.1 + p.wavePhase) * ampX;
+        const dy = Math.sin(waveTime * 2.8 + p.wavePhase * 1.3 + 0.8) * ampY;
+        p.x = clamp(p.baseX + dx, bounds.minX, bounds.maxX);
+        p.y = clamp(p.baseY + dy, bounds.minY, bounds.maxY);
+        lastWaveOffset.set(p.id, { dx: p.x - p.baseX, dy: p.y - p.baseY });
+      } else {
+        p.x = p.baseX;
+        p.y = p.baseY;
+        lastWaveOffset.set(p.id, { dx: 0, dy: 0 });
+      }
+    });
+  }
+
   function startLoop() {
     isRunning = true;
-    function loop() {
+    lastLoopTs = performance.now();
+    function loop(now) {
+      updateWave(now);
       render();
       animFrame = requestAnimationFrame(loop);
     }
-    loop();
+    animFrame = requestAnimationFrame(loop);
   }
 
   function stopLoop() {
@@ -464,24 +561,14 @@ const PuzzleEngine = (function () {
     if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
   }
 
-  // ─── External piece sync (multiplayer) ────────
-  function applyRemotePieceMove(pieceId, x, y, snapped, playerColor) {
-    const piece = pieces.find(p => p.id === pieceId);
-    if (!piece || piece.snapped) return;
-    piece.x = x; piece.y = y;
-    externalPieceColors[pieceId] = playerColor;
-    if (snapped && !piece.snapped) {
-      piece.snapped = true; piece.x = piece.snapX; piece.y = piece.snapY;
-      snappedCount++;
-      flashPiece(piece);
-    }
+  function setWaveEnabled(v) {
+    waveEnabled = !!v;
   }
 
-  function setRemoteGrab(pieceId, playerColor) {
-    lockedPieces.add(pieceId);
-    externalPieceColors[pieceId] = playerColor;
+  function setPaused(v) {
+    isPaused = !!v;
+    lastLoopTs = performance.now();
   }
-  function clearRemoteGrab(pieceId) { lockedPieces.delete(pieceId); }
 
   // ─── Ghost Preview ────────────────────────────
   function setGhostVisible(v) {
@@ -492,29 +579,12 @@ const PuzzleEngine = (function () {
   function shufflePieces() {
     pieces.forEach(p => {
       if (p.snapped) return;
-      p.x = Math.random() * (canvas.width - PIECE_W - (Network.isConnected() ? 220 : 0));
-      p.y = Math.random() * (canvas.height - PIECE_H);
+      const pos = randomScatterPos();
+      p.baseX = pos.x;
+      p.baseY = pos.y;
+      p.x = pos.x;
+      p.y = pos.y;
     });
-  }
-
-  // ─── Serialize for multiplayer ────────────────
-  function getPieceData() {
-    return pieces.map(p => ({ id: p.id, x: p.x, y: p.y, snapped: p.snapped }));
-  }
-
-  function applyInitialState(piecesData) {
-    piecesData.forEach(pd => {
-      const p = pieces.find(pp => pp.id === pd.id);
-      if (p) { p.x = pd.x; p.y = pd.y; if (pd.snapped) { p.snapped = true; p.x = p.snapX; p.y = p.snapY; snappedCount++; } }
-    });
-  }
-
-  // ─── Helpers ─────────────────────────────────
-  function hexToRgba(hex, a) {
-    const r = parseInt(hex.slice(1, 3), 16);
-    const g = parseInt(hex.slice(3, 5), 16);
-    const b = parseInt(hex.slice(5, 7), 16);
-    return `rgba(${r},${g},${b},${a})`;
   }
 
   // ─── Public API ──────────────────────────────
@@ -525,11 +595,8 @@ const PuzzleEngine = (function () {
     stopLoop,
     shufflePieces,
     setGhostVisible,
-    getPieceData,
-    applyInitialState,
-    applyRemotePieceMove,
-    setRemoteGrab,
-    clearRemoteGrab,
+    setWaveEnabled,
+    setPaused,
     getSnappedCount: () => snappedCount,
     getTotalPieces: () => totalPieces,
     getScore: () => score,
